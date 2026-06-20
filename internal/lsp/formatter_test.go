@@ -325,6 +325,194 @@ end
 	}
 }
 
+// createNonStandardOptionFixture builds a project whose .formatter.exs sets a
+// non-standard option (one outside the core Code.format_string!/2 set) and a
+// plugin that refuses to format unless that option is threaded through to its
+// opts. It guards against reintroducing an option allowlist in beam_server.exs.
+func createNonStandardOptionFixture(t *testing.T) string {
+	t.Helper()
+	mixRoot := t.TempDir()
+	for _, dir := range []string{"lib", "_build"} {
+		if err := os.MkdirAll(filepath.Join(mixRoot, dir), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "mix.exs"),
+		[]byte(`defmodule NonStandardOption.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :non_standard_option,
+      version: "0.1.0",
+      elixir: "~> 1.18"
+    ]
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, ".formatter.exs"),
+		[]byte("[plugins: [Dexter.MarkerFormatter], marker_option: \"THREADED\", inputs: [\"{lib,test}/**/*.{ex,exs,heex}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "lib", "marker_formatter.ex"),
+		[]byte(`defmodule Dexter.MarkerFormatter do
+  def features(_opts), do: [extensions: [".heex"], sigils: [:H]]
+
+  def format(input, opts) do
+    case Keyword.get(opts, :marker_option) do
+      "THREADED" -> String.replace(input, "PLACEHOLDER", "THREADED")
+      other -> raise "marker_option not passed through, got: #{inspect(other)}"
+    end
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("mix", "compile")
+	cmd.Dir = mixRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("could not compile marker formatter fixture: %v\n%s", err, out)
+	}
+	return mixRoot
+}
+
+func TestFormatterServer_NonStandardOptionReachesPlugin(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	mixRoot := createNonStandardOptionFixture(t)
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	server := NewServer(s, mixRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	filePath := filepath.Join(mixRoot, "lib", "component.heex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, "<div>PLACEHOLDER</div>\n")
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits from marker formatter plugin, got nil")
+	}
+	if !strings.Contains(edits[0].NewText, "THREADED") {
+		t.Errorf("expected non-standard marker_option to reach plugin opts, got:\n%s", edits[0].NewText)
+	}
+}
+
+func createMixConfigFormatterFixture(t *testing.T) string {
+	t.Helper()
+	mixRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mixRoot, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "mix.exs"),
+		[]byte(`defmodule MixConfigFormatter.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :mix_config_formatter,
+      version: "0.1.0",
+      elixir: "~> 1.18"
+    ]
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, ".formatter.exs"),
+		[]byte("[plugins: [Dexter.MixConfigFormatter], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "lib", "mix_config_formatter.ex"),
+		[]byte(`defmodule Dexter.MixConfigFormatter do
+  def features(_opts), do: [extensions: [".ex"]]
+
+  def format(input, _opts) do
+    _ = Mix.Project.config()
+    String.replace(input, ":needs_mix", ":mix_started")
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("mix", "compile")
+	cmd.Dir = mixRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("could not compile Mix config formatter fixture: %v\n%s", err, out)
+	}
+	return mixRoot
+}
+
+func TestFormatterServer_PluginCanCallMixProjectConfig(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	mixRoot := createMixConfigFormatterFixture(t)
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	server := NewServer(s, mixRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	filePath := filepath.Join(mixRoot, "lib", "example.ex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, "defmodule Example do\n  def value, do: :needs_mix\nend\n")
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits from Mix config formatter plugin, got nil")
+	}
+	if !strings.Contains(edits[0].NewText, ":mix_started") {
+		t.Errorf("expected formatter plugin to run after calling Mix.Project.config/0, got:\n%s", edits[0].NewText)
+	}
+}
+
 func TestFormatterServer_BasicProject(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")

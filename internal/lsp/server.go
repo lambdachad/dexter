@@ -233,6 +233,13 @@ func (s *Server) backgroundReindex() {
 			}
 		}
 
+		// Collapse the WAL back to disk now that the (potentially large) reindex
+		// is complete, so the -wal file does not stay parked at its high-water
+		// mark for the lifetime of the LSP process.
+		if err := s.store.Checkpoint(); err != nil {
+			log.Printf("Warning: WAL checkpoint after reindex: %v", err)
+		}
+
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
 
@@ -294,6 +301,26 @@ func (s *Server) notifyOTPMismatch(stderr string) {
 
 // === LSP Lifecycle ===
 
+// coerceBool accepts a JSON bool or a JSON string ("true"/"false"/"1"/"0"…).
+// Claude Code plugin template substitution (e.g. "${user_config.debug}") produces
+// a string, not a bool, so we accept both forms.
+func coerceBool(v interface{}) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		if x == "" {
+			return false, false
+		}
+		b, err := strconv.ParseBool(x)
+		if err != nil {
+			return false, false
+		}
+		return b, true
+	}
+	return false, false
+}
+
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
 	// Note: unlike cmd/main.go, the LSP deliberately does NOT pass "mix.exs"
 	// to store.FindProjectRoot. In a monorepo we want to anchor on
@@ -315,14 +342,17 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 
 	var explicitStdlibPath string
 	if opts, ok := params.InitializationOptions.(map[string]interface{}); ok {
-		if v, ok := opts["followDelegates"].(bool); ok {
+		if v, ok := coerceBool(opts["followDelegates"]); ok {
 			s.followDelegates = v
 		}
 		if v, ok := opts["stdlibPath"].(string); ok {
 			explicitStdlibPath = v
 		}
-		if v, ok := opts["debug"].(bool); ok {
+		if v, ok := coerceBool(opts["debug"]); ok {
 			s.debug = v
+		}
+		if v, ok := opts["maxTransientDocuments"].(float64); ok {
+			s.docs.SetMaxTransient(int(v))
 		}
 	}
 	if os.Getenv("DEXTER_DEBUG") == "true" {
@@ -565,7 +595,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		defer func() { s.debugf("Definition: total %s", time.Since(t0).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -629,7 +659,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 		// Variable go-to-definition via tree-sitter.
 		// The first occurrence in scope is the definition (pattern/assignment).
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				s.debugf("Definition: returning variable definition at line %d", occs[0].Line)
 				return []protocol.Location{{
@@ -1230,7 +1261,7 @@ func (s *Server) LogTrace(ctx context.Context, params *protocol.LogTraceParams) 
 func (s *Server) SetTrace(ctx context.Context, params *protocol.SetTraceParams) error { return nil }
 func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -1402,7 +1433,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	docURI := string(params.TextDocument.URI)
 	filePath := uriToPath(params.TextDocument.URI)
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -1504,7 +1535,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 							Kind:   protocol.CompletionItemKindFunction,
 							Detail: fmt.Sprintf(":%s.%s/%d", erlModule, e.Function, e.Arity),
 						}
-						applySnippet(&item, e.Function, e.Arity, e.Params, inPipe, s.snippetSupport)
+						applySnippet(&item, e.Function, e.Arity, e.Params, "", inPipe, s.snippetSupport)
 						items = append(items, item)
 					}
 				}
@@ -1566,7 +1597,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					"line":     r.Line,
 				},
 			}
-			applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, s.snippetSupport)
+			applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, s.snippetSupport)
 			items = append(items, item)
 		}
 
@@ -1654,7 +1685,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					Kind:   kindToCompletionItemKind(bf.Kind),
 					Detail: bf.Kind,
 				}
-				applySnippet(&item, bf.Name, bf.Arity, bf.Params, inPipe, s.snippetSupport)
+				applySnippet(&item, bf.Name, bf.Arity, bf.Params, bf.Kind, inPipe, s.snippetSupport)
 				items = append(items, item)
 			}
 		}
@@ -1682,7 +1713,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 							"line":     r.Line,
 						},
 					}
-					applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, s.snippetSupport)
+					applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, s.snippetSupport)
 					items = append(items, item)
 				}
 			}
@@ -1698,7 +1729,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 		// Variables in scope via tree-sitter
 		var varsInScope []string
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			varsInScope = treesitter.FindVariablesInScopeWithTree(tree.RootNode(), src, uint(lineNum), uint(col))
 		}
 		for _, varName := range varsInScope {
@@ -1724,6 +1756,21 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 						InsertTextFormat: protocol.InsertTextFormatSnippet,
 					})
 				}
+			}
+		}
+		// Plain keyword completions (e.g., "do", "end"). These don't
+		// expand to snippets; they just insert the keyword itself so
+		// that pressing Enter doesn't replace the keyword with a
+		// VS Code word-based suggestion.
+		for _, kw := range elixirKeywords {
+			if strings.HasPrefix(kw, funcPrefix) && !seen[kw] {
+				seen[kw] = true
+				items = append(items, protocol.CompletionItem{
+					Label:     kw,
+					Kind:      protocol.CompletionItemKindKeyword,
+					Detail:    "keyword",
+					Preselect: true,
+				})
 			}
 		}
 	}
@@ -2078,6 +2125,9 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 		if !strings.HasPrefix(funcName, funcPrefix) {
 			continue
 		}
+		if useSnippets && elixirFormSnippets[funcName] != "" {
+			continue
+		}
 		for _, d := range defs {
 			key := funcKey(funcName, d.arity)
 			if !seen[key] {
@@ -2091,7 +2141,7 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 						"line":     d.line,
 					},
 				}
-				applySnippet(&item, funcName, d.arity, d.params, inPipe, useSnippets)
+				applySnippet(&item, funcName, d.arity, d.params, d.kind, inPipe, useSnippets)
 				*items = append(*items, item)
 			}
 		}
@@ -2105,6 +2155,9 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 		for _, r := range results {
 			key := funcKey(r.Function, r.Arity)
 			if strings.HasPrefix(r.Function, funcPrefix) && !seen[key] {
+				if useSnippets && elixirFormSnippets[r.Function] != "" {
+					continue
+				}
 				seen[key] = true
 				item := protocol.CompletionItem{
 					Label:  r.Function,
@@ -2115,7 +2168,7 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 						"line":     r.Line,
 					},
 				}
-				applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, useSnippets)
+				applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, useSnippets)
 				*items = append(*items, item)
 			}
 		}
@@ -2266,22 +2319,83 @@ func funcKey(name string, arity int) string {
 	return name + "/" + strconv.Itoa(arity)
 }
 
+// elixirKeywords are plain keyword completions (no snippet expansion).
+// They prevent VS Code from falling back to word-based completions when the
+// user types a keyword like "do" or "end" and presses Enter.
+var elixirKeywords = []string{"do", "end"}
+
 var elixirFormSnippets = map[string]string{
-	"for":     "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
-	"with":    "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
-	"case":    "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
-	"cond":    "cond do\n\t${1:condition} ->\n\t\t$0\nend",
-	"if":      "if ${1:condition} do\n\t$0\nend",
-	"unless":  "unless ${1:condition} do\n\t$0\nend",
-	"receive": "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
-	"try":     "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
-	"quote":   "quote do\n\t$0\nend",
-	"fn":      "fn ${1:args} -> $0 end",
+	"do":             "do\n\t$0\nend",
+	"defmodule":      "defmodule ${1:Name} do\n\t$0\nend",
+	"def":            "def ${1:name}$2 do\n\t$0\nend",
+	"defp":           "defp ${1:name}$2 do\n\t$0\nend",
+	"defmacro":       "defmacro ${1:name}$2 do\n\t$0\nend",
+	"defmacrop":      "defmacrop ${1:name}$2 do\n\t$0\nend",
+	"defstruct":      "defstruct [${1:fields}]$0",
+	"defexception":   "defexception [${1:fields}]$0",
+	"defprotocol":    "defprotocol ${1:Name} do\n\t$0\nend",
+	"defimpl":        "defimpl ${1:Protocol}, for: ${2:Type} do\n\t$0\nend",
+	"defdelegate":    "defdelegate ${1:func}$2, to: ${3:module}$0",
+	"defguard":       "defguard ${1:name}$2 when ${3:condition}$0",
+	"defguardp":      "defguardp ${1:name}$2 when ${3:condition}$0",
+	"defoverridable": "defoverridable ${1:name}: ${2:arity}$0",
+	"for":            "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
+	"with":           "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
+	"case":           "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
+	"cond":           "cond do\n\t${1:condition} ->\n\t\t$0\nend",
+	"if":             "if ${1:condition} do\n\t$0\nelse\n\t${2}\nend",
+	"unless":         "unless ${1:condition} do\n\t$0\nend",
+	"receive":        "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
+	"try":            "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
+	"quote":          "quote do\n\t$0\nend",
+	"fn":             "fn ${1:args} -> $0 end",
 }
 
-func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {
+// noParenFuncs are macros conventionally written without parentheses in Elixir,
+// such as ExUnit's test/describe. When generating completion snippets or plain
+// call text, these names produce `name arg1, arg2` instead of `name(arg1, arg2)`.
+var noParenFuncs = map[string]bool{
+	"test":            true,
+	"describe":        true,
+	"assert":          true,
+	"refute":          true,
+	"assert_raise":    true,
+	"assert_receive":  true,
+	"assert_received": true,
+	"refute_receive":  true,
+	"refute_received": true,
+	"setup":           true,
+	"setup_all":       true,
+	"catch_error":     true,
+	"catch_exit":      true,
+	"catch_throw":     true,
+}
+
+// doBlockSnippets provides custom snippet templates for functions that take
+// do/end blocks. These are applied when the function is in scope via the
+// import/use-chain (unlike elixirFormSnippets which are global special forms).
+var doBlockSnippets = map[string]string{
+	"test":         "test \"${1:description}\" do\n\t$0\nend",
+	"describe":     "describe \"${1:description}\" do\n\t$0\nend",
+	"setup":        "setup do\n\t$0\nend",
+	"setup_all":    "setup_all do\n\t$0\nend",
+	"assert_raise": "assert_raise ${1:exception} do\n\t$0\nend",
+}
+
+func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, kind string, inPipe bool, useSnippets bool) {
 	item.Label = fmt.Sprintf("%s/%d", name, arity)
 	item.FilterText = name
+
+	// Check for a do-block snippet template first. These provide full
+	// do/end block structure (e.g. `test "..." do ... end`) and take
+	// priority over auto-generated arg lists.
+	if useSnippets && isMacroKind(kind) {
+		if tmpl, ok := doBlockSnippets[name]; ok {
+			item.InsertTextFormat = protocol.InsertTextFormatSnippet
+			item.InsertText = tmpl
+			return
+		}
+	}
 
 	snippetArity := arity
 	snippetParams := params
@@ -2298,9 +2412,13 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 		}
 	}
 
+	noParen := noParenFuncs[name]
+
 	if !useSnippets {
 		if snippetArity > 0 {
-			item.InsertText = functionCallText(name, snippetArity, snippetParams, paramStartIndex)
+			item.InsertText = functionCallText(name, snippetArity, snippetParams, paramStartIndex, noParen)
+		} else if noParen {
+			item.InsertText = name
 		} else {
 			item.InsertText = name + "()"
 		}
@@ -2309,21 +2427,27 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 
 	if snippetArity > 0 {
 		item.InsertTextFormat = protocol.InsertTextFormatSnippet
-		item.InsertText = functionSnippet(name, snippetArity, snippetParams, paramStartIndex)
+		item.InsertText = functionSnippet(name, snippetArity, snippetParams, paramStartIndex, noParen)
+	} else if noParen {
+		item.InsertText = name
 	} else {
 		item.InsertText = name + "()"
 	}
 }
 
-func functionSnippet(name string, arity int, params string, paramStartIndex int) string {
-	return buildCallText(name, arity, params, true, paramStartIndex)
+func isMacroKind(kind string) bool {
+	return kind == "defmacro" || kind == "defmacrop"
 }
 
-func functionCallText(name string, arity int, params string, paramStartIndex int) string {
-	return buildCallText(name, arity, params, false, paramStartIndex)
+func functionSnippet(name string, arity int, params string, paramStartIndex int, noParen bool) string {
+	return buildCallText(name, arity, params, true, paramStartIndex, noParen)
 }
 
-func buildCallText(name string, arity int, params string, snippet bool, paramStartIndex int) string {
+func functionCallText(name string, arity int, params string, paramStartIndex int, noParen bool) string {
+	return buildCallText(name, arity, params, false, paramStartIndex, noParen)
+}
+
+func buildCallText(name string, arity int, params string, snippet bool, paramStartIndex int, noParen bool) string {
 	if paramStartIndex < 1 {
 		paramStartIndex = 1
 	}
@@ -2342,6 +2466,12 @@ func buildCallText(name string, arity int, params string, snippet bool, paramSta
 		} else {
 			args = append(args, paramName)
 		}
+	}
+	if noParen {
+		if snippet {
+			return name + " " + strings.Join(args, ", ") + "$0"
+		}
+		return name + " " + strings.Join(args, ", ")
 	}
 	call := name + "(" + strings.Join(args, ", ") + ")"
 	if snippet {
@@ -2418,7 +2548,7 @@ func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationPa
 		defer func() { s.debugf("Declaration: total %s", time.Since(t0).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		s.debugf("Declaration: document not open")
 		return nil, nil
@@ -2642,7 +2772,7 @@ func (s *Server) DocumentColor(ctx context.Context, params *protocol.DocumentCol
 }
 func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.DocumentHighlightParams) ([]protocol.DocumentHighlight, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -2650,10 +2780,11 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 	lineNum := int(params.Position.Line)
 	col := int(params.Position.Character)
 
-	tree, src, hasTree := s.docs.GetTree(docURI)
+	tree, src, release, hasTree := s.docs.GetTree(docURI)
 	if !hasTree {
 		return nil, nil
 	}
+	defer release()
 	root := tree.RootNode()
 
 	// Try scope-aware variable highlight first
@@ -2714,7 +2845,7 @@ func (s *Server) DocumentLinkResolve(ctx context.Context, params *protocol.Docum
 }
 func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]interface{}, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3116,7 +3247,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			if i+1 < n && tokens[i+1].Kind == parser.TokColon {
 				continue
 			}
-			doIdx, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, i+1)
+			doIdx, nextPos, hasDoBlock := parser.ScanForwardToMacroCallBlockDo(tokens, n, i+1)
 			if !hasDoBlock {
 				continue
 			}
@@ -3124,10 +3255,12 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			lineIdx := tok.Line - 1
 			indent := tokCol(tok)
 
-			// Extract the argument between the macro name and `do` from source bytes
+			// Extract the argument between the macro name and `do` from source bytes.
+			// Collapse internal whitespace so a multi-line keyword-arg head renders
+			// as a single-line outline label.
 			label := macroName
 			argBytes := source[tok.End:tokens[doIdx].Start]
-			arg := strings.TrimSpace(string(argBytes))
+			arg := strings.Join(strings.Fields(string(argBytes)), " ")
 			if len(arg) >= 2 && arg[0] == '"' && arg[len(arg)-1] == '"' {
 				arg = arg[1 : len(arg)-1]
 			}
@@ -3220,7 +3353,7 @@ func (s *Server) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCom
 }
 func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3364,7 +3497,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
 	docURI := string(params.TextDocument.URI)
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3479,7 +3612,7 @@ func (s *Server) Implementation(ctx context.Context, params *protocol.Implementa
 		defer func() { s.debugf("Implementation: total %s", time.Since(t0).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3546,7 +3679,7 @@ func (s *Server) OnTypeFormatting(ctx context.Context, params *protocol.Document
 }
 func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3569,7 +3702,8 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	// For bare identifiers (no module qualifier), check tree-sitter variables
 	// first — a local variable shadows a same-named function in Elixir.
 	if moduleRef == "" {
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				for _, occ := range occs {
 					if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
@@ -3689,7 +3823,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		defer func() { s.debugf("References: total %s", time.Since(t).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		s.debugf("References: document not found in store")
 		return nil, nil
@@ -3766,7 +3900,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		// function with the same name, so variable references take priority.
 		// Bare identifiers that aren't defined as variables fall through to
 		// function reference lookup.
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				var locations []protocol.Location
 				for _, occ := range occs {
@@ -3949,7 +4084,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3971,7 +4106,8 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	// For bare identifiers, check tree-sitter variables first — a local
 	// variable shadows a same-named function in Elixir.
 	if moduleRef == "" {
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				if treesitter.NameExistsInScopeOf(tree.RootNode(), src, uint(lineNum), uint(col), params.NewName) {
 					return nil, fmt.Errorf("variable %q already exists in this scope", params.NewName)
@@ -4940,10 +5076,12 @@ func isDepsFileUncached(filePath string) bool {
 }
 
 // readFileText returns the contents of filePath, preferring the in-memory
-// document store for open buffers. The second return indicates whether the
-// file is currently open in the editor.
+// document store for editor-owned (didOpen) buffers. The second return
+// indicates whether the file is currently open in the editor — transient
+// entries loaded from disk via GetOrLoad are NOT reported as open.
 func (s *Server) readFileText(filePath string) (text string, open bool, ok bool) {
-	if t, found := s.docs.Get(string(uri.File(filePath))); found {
+	uri := string(uri.File(filePath))
+	if t, found := s.docs.GetIfOpen(uri); found {
 		return t, true, true
 	}
 	if data, err := os.ReadFile(filePath); err == nil {
@@ -4953,11 +5091,14 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 }
 
 // getFileLine returns the text of line lineNum (1-based) from the file at
-// filePath, preferring the in-memory document store for open buffers.
-// For closed files, only reads up to the target line instead of the whole file.
+// filePath, preferring the in-memory document store for editor-owned
+// buffers. Transient entries loaded via GetOrLoad fall through to the
+// disk path. For closed files, only reads up to the target line instead
+// of the whole file.
 func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
-	// Open buffer: extract the single line without splitting the entire text
-	if text, ok := s.docs.Get(string(uri.File(filePath))); ok {
+	// Editor-owned buffer: extract the single line from memory
+	uri := string(uri.File(filePath))
+	if text, ok := s.docs.GetIfOpen(uri); ok {
 		line, found := nthLine(text, lineNum-1)
 		if found {
 			return line, true
@@ -5010,7 +5151,7 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 }
 func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -5177,7 +5318,7 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 }
 func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) ([]protocol.Location, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -5250,7 +5391,7 @@ func (s *Server) DidDeleteFiles(ctx context.Context, params *protocol.DeleteFile
 func (s *Server) CodeLensRefresh(ctx context.Context) error { return nil }
 func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.CallHierarchyPrepareParams) ([]protocol.CallHierarchyItem, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}

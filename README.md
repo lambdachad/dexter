@@ -15,6 +15,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
     - [Configuring format on save](#configuring-format-on-save)
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
+  - [Claude Code](#claude-code)
   - [Emacs](#emacs)
     - [Eglot](#eglot)
       - [Emacs version \>= 30](#emacs-version--30)
@@ -84,13 +85,13 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
    ```sh
    # via mise
-   mise plugin add dexter https://github.com/remoteoss/dexter.git && mise use -g dexter@latest
+   mise use -g aqua:remoteoss/dexter@latest
 
    # via asdf
    asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf set --home dexter latest
-   
+
    # via Homebrew
-   brew install remoteoss/tap/dexter
+   brew install dexter-lsp
    ```
 
    Or [build from source](#development-building-from-source).
@@ -235,7 +236,7 @@ See the [Zed docs](https://zed.dev/docs/languages/elixir#using-dexter) for full 
 }
 ```
 
-If you already have Dexter installed via [mise](https://mise.jdx.dev/), the extension will use your local binary from PATH instead of downloading.
+If you already have Dexter installed via [mise](https://mise.en.dev/), the extension will use your local binary from PATH instead of downloading.
 
 To override the binary path manually, add this to your `settings.json`:
 
@@ -318,6 +319,29 @@ args = ["lsp"]
 name = "elixir"
 language-servers = ["dexter"]
 ```
+
+### Claude Code
+
+[Claude Code](https://claude.ai/code) supports Dexter as an Elixir LSP via its plugin system, enabling go-to-definition, hover docs, find references, and more when working on `.ex`, `.exs`, and `.heex` files.
+
+**Prerequisites:** The LSP tool must be enabled. Add this to your `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ENABLE_LSP_TOOL": "1"
+  }
+}
+```
+
+**Install:**
+
+```sh
+claude plugin marketplace add remoteoss/dexter
+claude plugin install dexter-lsp@dexter
+```
+
+That's it. Open an Elixir project in Claude Code and Dexter will handle go-to-definition, hover documentation, find references, and more.
 
 ## Why build another LSP?
 
@@ -484,6 +508,12 @@ Plugins ([`Styler`](https://github.com/remoteoss/elixir-styler), `Phoenix.LiveVi
 your project's `_build/dev/lib`. So as long as your formatter plugins are installed and compiled, everything is ready to
 go.
 
+**Non-standard formatter options:** Dexter passes your `.formatter.exs` options through to plugins as-is, matching `mix
+format`. So plugin-specific options like `Phoenix.LiveView.HTMLFormatter`'s `:heex_line_length`, `:attribute_formatters`,
+and `:inline_matcher` are honored. One caveat: the persistent process runs outside `Mix`, so a plugin that resolves
+config at format time via `Mix.*` or `Application.get_env/2` (e.g. `CanonicalTailwind` looking up its Tailwind binary)
+won't see it — inline that config directly in `.formatter.exs` instead (e.g. `canonical_tailwind: [binary: "PATH"]`).
+
 If the persistent process can't start, dexter falls back to running `mix format` directly.
 
 **Syntax errors** found by the formatter are surfaced as LSP diagnostics pointing to the exact line and column, with a warning at the hint location (e.g. "the `do` on line 52 does not have a matching `end`"). Diagnostics clear on the next successful format (which again, is nearly instantaneous!).
@@ -499,6 +529,7 @@ Dexter reads `initializationOptions` from your editor configuration:
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
+- **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.
 
 ## Index database location (.dexter/)
 
@@ -567,17 +598,15 @@ make release VERSION=0.2.0
 
 # 2. Push the branch and merge it into main
 
-# 3. Tag and push the tag
+# 3. Review CHANGELOG.md, then tag and push the tag
 make tag VERSION=0.2.0
 ```
 
-This updates the version in `internal/version/version.go` on a release branch. After merging to main, `make tag` creates and pushes the git tag. Users can then upgrade via mise:
+This updates the version in `internal/version/version.go` on a release branch. After merging to main, review the matching `CHANGELOG.md` entry because the GitHub release notes are published from that section. Then `make tag` creates and pushes the git tag. Users can then upgrade via mise:
 
 ```sh
-mise plugin update dexter && mise install dexter@latest
+mise upgrade aqua:remoteoss/dexter
 ```
-
-The plugin update step is required to pick up newly tagged releases. Without it, `mise install dexter@latest` will resolve against a stale list.
 
 If the release changes how Elixir files are parsed or what gets stored in the index (e.g. a new definition kind, a change to delegate resolution), also bump `IndexVersion` in `internal/version/version.go`. Dexter will automatically rebuild the index when users upgrade to a binary with a higher `IndexVersion` — no manual `dexter init --force` required.
 

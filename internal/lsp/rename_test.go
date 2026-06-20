@@ -418,6 +418,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 1, 6)
 	if r == nil {
 		t.Fatal("expected non-nil range")
+		return
 	}
 	if r.Start.Line != 1 {
 		t.Errorf("expected line 1, got %d", r.Start.Line)
@@ -447,6 +448,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 0, 20)
 	if r == nil {
 		t.Fatal("expected non-nil range")
+		return
 	}
 	// Should highlight just "Accounts" (the last segment), not "MyApp.Accounts"
 	// "Accounts" starts at col 16, ends at col 24
@@ -820,6 +822,7 @@ end
 	rng := prepareRenameAt(t, server, docURI, 3, 10)
 	if rng == nil {
 		t.Fatal("expected PrepareRename to return a range for the variable")
+		return
 	}
 	// The highlighted range should be on line 3 (the variable), not line 6 (the function)
 	if rng.Start.Line != 3 {
@@ -1091,6 +1094,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 4, 4)
 	if r == nil {
 		t.Fatal("expected PrepareRename to succeed for as: alias")
+		return
 	}
 	if r.Start.Line != 4 {
 		t.Errorf("expected highlight on line 4, got line %d", r.Start.Line)
@@ -1120,6 +1124,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 5, 6)
 	if r == nil {
 		t.Fatal("expected PrepareRename to succeed for nested module function")
+		return
 	}
 	if r.Start.Line != 5 {
 		t.Errorf("expected highlight on line 5, got line %d", r.Start.Line)
@@ -1259,6 +1264,49 @@ end
 	}
 	if fileContains(callerPath, "MyApp.Auth.Accounts") {
 		t.Error("unexpected MyApp.Auth.Accounts in caller file")
+	}
+}
+
+func TestRename_Module_PlainAliasUpdatesRequireInSameFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	defContent := `defmodule SharedLib.Values.ServiceEndpointConfig do
+  defmacro __using__(_), do: :ok
+end
+`
+	// A config script that aliases the module by its plain (last-segment) name
+	// and then refers to it by that short name in a `require`.
+	callerContent := `import Config
+
+alias SharedLib.Values.ServiceEndpointConfig
+
+require ServiceEndpointConfig
+`
+	callerPath := filepath.Join(server.projectRoot, "config", "runtime.exs")
+	indexFile(t, server.store, server.projectRoot, "lib/service_endpoint_config.ex", defContent)
+	indexFile(t, server.store, server.projectRoot, "config/runtime.exs", callerContent)
+
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Rename the alias on the alias line (line 2). Column 20 is the start of
+	// "ServiceEndpointConfig" in "alias SharedLib.Values.ServiceEndpointConfig".
+	edit := renameAt(t, server, callerURI, 2, uint32(len("alias SharedLib.Values.")), "PublicEndpointConfig")
+	if edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	edits := collectEdits(edit, callerPath)
+
+	// The alias declaration's full module reference must be updated.
+	if !hasEdit(edits, "SharedLib.Values.PublicEndpointConfig") {
+		t.Errorf("expected alias line full-module edit to SharedLib.Values.PublicEndpointConfig; edits=%+v", edits)
+	}
+	// The `require` referencing the short alias name must also be updated, and
+	// only its short-name segment (line 4) — not turned into the full module.
+	if !editsContainLine(edits, 4) || !hasEdit(edits, "PublicEndpointConfig") {
+		t.Errorf("expected `require` short-name on line 4 to be renamed to PublicEndpointConfig; edits=%+v", edits)
 	}
 }
 
@@ -1883,6 +1931,7 @@ end
 	r := prepareRenameAt(t, server, defURI, 0, 16)
 	if r == nil {
 		t.Fatal("expected non-nil prepareRename result")
+		return
 	}
 	// "CostCalculator" starts at col 16 in "defmodule MyApp.CostCalculator do"
 	if r.Start.Character != 16 {

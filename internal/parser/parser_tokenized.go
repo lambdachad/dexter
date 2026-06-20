@@ -309,7 +309,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			defLine := tok.Line
 			i++
 			j := nextSig(i)
-			if j >= n || tokens[j].Kind != TokIdent {
+			if j >= n || !isValidFuncNameToken(tokens[j].Kind) {
 				i = j
 				goto extractRefsForLine
 			}
@@ -427,8 +427,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			j := nextSig(i)
 			modName, k := collectModuleName(j)
 			if modName != "" {
-				resolved := resolveModule(modName, currentModule())
-				if !strings.Contains(resolved, "__MODULE__") {
+				resolved := ResolveModuleRef(modName, aliases, currentModule())
+				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: importLine, FilePath: path, Kind: "import"})
 					injectors[resolved] = true
 				}
@@ -442,8 +442,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			j := nextSig(i)
 			modName, k := collectModuleName(j)
 			if modName != "" {
-				resolved := resolveModule(modName, currentModule())
-				if !strings.Contains(resolved, "__MODULE__") {
+				resolved := ResolveModuleRef(modName, aliases, currentModule())
+				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "use"})
 					injectors[resolved] = true
 				}
@@ -464,8 +464,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 
 			// Check for require Module, as: Name
 			if asName, nextPos, ok := ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
-				resolved := resolveModule(modName, cm)
-				if !strings.Contains(resolved, "__MODULE__") {
+				resolved := ResolveModuleRef(modName, aliases, cm)
+				if resolved != "" {
 					aliases[asName] = resolved
 					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 				}
@@ -474,8 +474,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			}
 
 			// Simple require (no as:) — still emit reference but no alias
-			resolved := resolveModule(modName, cm)
-			if !strings.Contains(resolved, "__MODULE__") {
+			resolved := ResolveModuleRef(modName, aliases, cm)
+			if resolved != "" {
 				refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 			}
 			i = k
@@ -667,41 +667,10 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 								// macro_name :atom
 								emit = true
 							default:
-								// Scan forward to see if TokDo follows the arguments.
-								// In Elixir, `do` can follow across EOLs and blank lines
-								// but not past an intervening statement. We track whether
-								// we've seen EOL at bracket depth 0: once we have, the
-								// only token that can continue the expression is `do`.
-								scanDepth := 0
-								seenEOLAtZero := false
-								for k := j; k < n; k++ {
-									switch tokens[k].Kind {
-									case TokDo:
-										if scanDepth == 0 {
-											emit = true
-										}
-									case TokEOL, TokComment:
-										if scanDepth == 0 {
-											seenEOLAtZero = true
-										}
-									case TokOpenParen, TokOpenBracket, TokOpenBrace:
-										scanDepth++
-										seenEOLAtZero = false
-									case TokCloseParen, TokCloseBracket, TokCloseBrace:
-										scanDepth--
-									case TokEOF:
-										k = n
-									default:
-										// At depth 0, after seeing EOL, any non-do
-										// token means a new statement started.
-										if scanDepth == 0 && seenEOLAtZero {
-											k = n // stop
-										}
-									}
-									if emit {
-										break
-									}
-								}
+								// Scan forward to see if a block-opening `do` follows the
+								// arguments, respecting bracket depth and statement boundaries.
+								_, _, hasDo := ScanForwardToMacroCallBlockDo(tokens, n, j)
+								emit = hasDo
 							}
 						}
 						if emit {
@@ -817,6 +786,17 @@ func NextSigToken(tokens []Token, n, from int) int {
 		from++
 	}
 	return from
+}
+
+// isValidFuncNameToken reports whether a token kind can appear as a function
+// name after def/defp/defmacro/defmacrop/defguard/defguardp/defdelegate.
+// In addition to ordinary identifiers (TokIdent), this includes tokens like
+// TokDefstruct and TokDefprotocol that are used as function names in the
+// stdlib (e.g. `defmacro defstruct(fields)` in Kernel).
+func isValidFuncNameToken(kind TokenKind) bool {
+	return kind == TokIdent ||
+		kind == TokDefstruct || kind == TokDefexception ||
+		kind == TokDefprotocol || kind == TokDefimpl
 }
 
 func CollectModuleName(source []byte, tokens []Token, n, i int) (string, int) {
